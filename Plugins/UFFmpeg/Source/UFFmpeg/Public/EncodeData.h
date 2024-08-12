@@ -3,49 +3,50 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "EncodeData.generated.h"
-/**
- * 
- */
 
-DECLARE_DELEGATE_OneParam(EncodeDelegate,uint8*)
+DECLARE_DELEGATE_OneParam(Uint8EncodeDelegate,   uint8*)
+DECLARE_DELEGATE_OneParam(DoubleEncodeDelegate, double*)
 
-
-class UFFMPEG_API FEncodeData
+template<typename DataType>
+class FEncodeData
 {
 public:
-
-	FEncodeData();
+    FEncodeData();
 	~FEncodeData();
+
+    DataType* GetData();
 	void InitializeData(int size);
-	void SetEncodeData(uint8* Src);
-	uint8* GetData();
+	void SetEncodeData(DataType* Src);
+
 private:
-	uint8* DataMemory;
-	int datasize;
+	int        DataSize;
+    DataType*  DataMemory;
 };
 
-UCLASS()
-class UFFMPEG_API UCircleQueue:public UObject
+template<typename DataType>
+class UCircleQueue
 {
-	GENERATED_BODY()
 public:
 	UCircleQueue();
 	~UCircleQueue();
 
-	void Init(int queue_len,int data_size);
-	bool InsertEncodeData(uint8* Src);
-	bool PrcessEncodeData();
 	bool IsFull();
 	bool IsEmpty();
-	EncodeDelegate encode_delegate;
+    void Resize(int DataSize);
+	void Init(int QueueLength, int DataSize);
+	bool InsertEncodeData(DataType* Data);
+	bool PrcessEncodeData();
+
+    Uint8EncodeDelegate  EncodeDelegateUint8;
+	DoubleEncodeDelegate EncodeDelegateDouble;
+
 private:
-	int queue_num;
-	//队列空闲数量
-	int queue_freenum;
-	int queue_head;
-	int queue_tail;
-	FEncodeData* queue_ptr;
+	uint32 QueueNum;
+	uint32 QueueHead;
+	uint32 QueueTail;
+	uint32 QueueFreeNum;
+
+    FEncodeData<DataType>* Queue;
 };
 
 

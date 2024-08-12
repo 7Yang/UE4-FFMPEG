@@ -1,86 +1,112 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
-
 #include "EncodeData.h"
+#include <type_traits>
 
-FEncodeData::FEncodeData():
-	DataMemory(nullptr)
-{
+template<typename DataType>
+FEncodeData<DataType>::FEncodeData() 
+    : DataMemory(nullptr)
+{ 
 }
 
-FEncodeData::~FEncodeData()
+template<typename DataType>
+FEncodeData<DataType>::~FEncodeData()
 {
-	if (DataMemory)
-		FMemory::Free(DataMemory);
+	if (DataMemory) FMemory::Free(DataMemory);
 }
 
-void FEncodeData::InitializeData(int size)
+template<typename DataType>
+void FEncodeData<DataType>::InitializeData(int Size)
 {
-	DataMemory = (uint8*)FMemory::Realloc(DataMemory, size);
-	datasize = size;
+	DataSize   = Size;
+	DataMemory = (DataType*)FMemory::Realloc(DataMemory, Size);
 }
 
-void FEncodeData::SetEncodeData(uint8* Src)
+template<typename DataType>
+void FEncodeData<DataType>::SetEncodeData(DataType* Src)
 {	
-	FMemory::StreamingMemcpy(DataMemory, Src, datasize);	
+	FMemory::StreamingMemcpy(DataMemory, Src, DataSize);	
 }
 
-uint8* FEncodeData::GetData()
+template<typename DataType>
+DataType* FEncodeData<DataType>::GetData()
 {
 	return DataMemory != nullptr ? DataMemory : nullptr;
 }
 
-//////////////////////////////////////////////////////////////////
-
-UCircleQueue::UCircleQueue():
-	queue_ptr(nullptr)
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+template<typename DataType>
+UCircleQueue<DataType>::UCircleQueue():
+	Queue(nullptr)
 {
-	queue_head = 0;
-	queue_tail = 0;
+	QueueHead = 0;
+	QueueTail = 0;
 }
 
-UCircleQueue::~UCircleQueue()
+template<typename DataType>
+UCircleQueue<DataType>::~UCircleQueue()
 {
-	delete[] queue_ptr;
+	delete[] Queue;
 }
 
-void UCircleQueue::Init(int queue_len, int data_sized)
+template<typename DataType>
+void UCircleQueue<DataType>::Resize(int DataSize)
 {
-	queue_num = queue_len;
-	queue_freenum = queue_num;
-	queue_ptr = new FEncodeData[queue_num];
-	for (int i = 0; i < queue_num; ++i)
+    checkf(QueueNum, TEXT("must Init() before!"));
+    for (uint32 i = 0; i < QueueNum; ++i)
+    {
+        Queue[i].InitializeData(DataSize);
+    }
+}
+
+template<typename DataType>
+void UCircleQueue<DataType>::Init(int QueueLen, int DataSized)
+{
+	QueueNum     = QueueLen;
+	QueueFreeNum = QueueNum;
+	Queue        = new FEncodeData<DataType>[QueueNum];
+	for (uint32 i = 0; i < QueueNum; ++i)
 	{
-		queue_ptr[i].InitializeData(data_sized);
+		Queue[i].InitializeData(DataSized);
 	}
 }
 
-bool UCircleQueue::InsertEncodeData(uint8* Src)
+template<typename DataType>
+bool UCircleQueue<DataType>::InsertEncodeData(DataType* NewData)
 {
-	if (IsFull())
-		return false;
-	queue_ptr[queue_tail].SetEncodeData(Src);
-	--queue_freenum;
-	queue_tail = (queue_tail + 1) % queue_num;
+	if (IsFull()) return false;
+
+	Queue[QueueTail].SetEncodeData(NewData);
+	--QueueFreeNum;
+	QueueTail = (QueueTail + 1) % QueueNum;
+
 	return true;
 }
 
-bool UCircleQueue::PrcessEncodeData()
+template<typename DataType>
+bool UCircleQueue<DataType>::PrcessEncodeData()
 {
-	if (IsEmpty())
-		return false;
-	encode_delegate.ExecuteIfBound(queue_ptr[queue_head].GetData());
-	queue_head= (queue_head + 1) % queue_num;
-	++queue_freenum;
+	if (IsEmpty()) return false;
+
+    if (std::is_same<DataType, uint8>())
+        EncodeDelegateUint8 .ExecuteIfBound(( uint8*)Queue[QueueHead].GetData());
+    else if (std::is_same<DataType, double>())
+        EncodeDelegateDouble.ExecuteIfBound((double*)Queue[QueueHead].GetData());
+
+	QueueHead = (QueueHead + 1) % QueueNum;
+	++QueueFreeNum;
+
 	return true;
 }
 
-bool UCircleQueue::IsFull()
+template<typename DataType>
+bool UCircleQueue<DataType>::IsFull()
 {
-	return queue_freenum == 0 ? true : false;
+	return QueueFreeNum == 0 ? true : false;
 }
 
-bool UCircleQueue::IsEmpty()
+template<typename DataType>
+bool UCircleQueue<DataType>::IsEmpty()
 {
-	return queue_freenum == queue_num ? true : false;
+	return QueueFreeNum == QueueNum ? true : false;
 }

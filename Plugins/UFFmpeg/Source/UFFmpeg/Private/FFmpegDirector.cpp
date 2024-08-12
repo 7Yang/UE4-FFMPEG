@@ -1,48 +1,45 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
-
 #include "FFmpegDirector.h"
-#include "Engine/GameViewportClient.h"
-#include "SceneViewport.h"
-#include "SlateApplication.h"
-#include "EncoderThread.h"
 #include "EncodeData.h"
-#include "LogVerbosity.h"
-#include "Ticker.h"
-#include "Editor.h"
+#include "EncoderThread.h"
 
 #include "Engine/World.h"
-#include "FileManager.h"
-#include "FileHelper.h"
-#include "RenderingThread.h"
-#include "RHI.h"
-#include "CoreDelegates.h"
-#include "GameDelegates.h"
+#include "Containers/Ticker.h"
+#include "Logging/LogVerbosity.h"
 
-UFFmpegDirector::UFFmpegDirector() :
-	outputs(nullptr),
-	inputs(nullptr),
-	filter_graph(nullptr),
-	buffersink_ctx(nullptr),
-	buffersrc_ctx(nullptr),
-	AudioDevice(nullptr),
-	gameWindow(nullptr),
-	buff_bgr(nullptr),
-	Runnable(nullptr),
-	RunnableThread(nullptr),
-	out_format_context(nullptr),
-	video_encoder_codec_context(nullptr),
-	audio_encoder_codec_context(nullptr),
-	sws_context(nullptr),
-	out_video_stream(nullptr),
-	out_audio_stream(nullptr),
-	swr(nullptr),
-	audio_frame(nullptr),
-	video_frame(nullptr)
+#include "Misc/DateTime.h"
+#include "Misc/CoreDelegates.h"
+#include "Misc/MessageDialog.h"
+
+#include "RenderingThread.h"
+#include "RenderGraphBuilder.h"
+#include "Framework/Application/SlateApplication.h"
+
+#define SAFE_FREE(Obj) \
+{                      \
+    delete Obj;        \
+    Obj = nullptr;     \
+}
+
+static int64 GetUtcNowMissisecond() 
 {
-	outs[0] = nullptr;
-	outs[1] = nullptr;
-	video_fps = 0;
+    return FDateTime::UtcNow().GetTicks() / ETimespan::TicksPerMillisecond;
+}
+
+UFFmpegDirector::UFFmpegDirector() : 
+    IsClosing(false), IsConnected(false), IsMarkReceive(false), IsDestory(false),
+    SlateWindow(nullptr), FormatContext(nullptr), VideoCodecContext(nullptr), VideoStream(nullptr), VideoFrame(nullptr), VideoFrameBufferPtr(nullptr), 
+    AudioDevice(nullptr), AudioCodecContext(nullptr), AudioStream(nullptr), AudioFrame(nullptr), 
+    SWResample(nullptr),  SWSResampleContext(nullptr), 
+    FilterGraph(nullptr), FilterInputs(nullptr), FilterOutputs(nullptr), BufferSource(nullptr), BufferSink(nullptr), 
+    Runnable(nullptr), RunnableThread(nullptr)
+{
+	VideoFps         = 0;
+    AudioLastSendPts = 0;
+    VideoLastSendPts = 0;
+    CurrentTime      = 0.f;
+    FMemory::Memzero(SWSResampleOuts, sizeof(uint8) * 2);
 }
 
 UFFmpegDirector::~UFFmpegDirector()
@@ -50,539 +47,768 @@ UFFmpegDirector::~UFFmpegDirector()
 
 }
 
-void UFFmpegDirector::DestoryDirector()
+void UFFmpegDirector::FinishDirector()
 {
 	if (!IsDestory)
 	{
-		RunnableThread->Kill(true);
-		delete Runnable;
-		Runnable = nullptr;
+        if (IsConnected) 
+        {
+            Runnable->Stop();
+            RunnableThread->Kill(true);
+            SAFE_FREE(Runnable);
+        }
 
-		if (AudioDevice)
-		{
-			AudioDevice->UnregisterSubmixBufferListener(this);
-		}
-		FSlateApplication::Get().GetRenderer()->OnBackBufferReadyToPresent().RemoveAll(this);
+        if (IsConnected)
+        {
+            //FEditorDelegates::PrePIEEnded.Remove(EndPIEDelegateHandle);
+            FTSTicker::GetCoreTicker().RemoveTicker(TickDelegateHandle);
 
-		FEditorDelegates::PrePIEEnded.Remove(EndPIEDelegateHandle);
+            if (AudioDevice)
+            {
+                AudioDevice->UnregisterSubmixBufferListener(this);
+            }
 
-		FTicker::GetCoreTicker().RemoveTicker(TickDelegateHandle);
+            if (FSlateApplication::IsInitialized())
+            {
+                FSlateApplication::Get().GetRenderer()->OnBackBufferReadyToPresent().RemoveAll(this);
+                FSlateApplication::Get().GetRenderer()->OnPostResizeWindowBackBuffer().RemoveAll(this);
+            }
+        }
 
-		Encode_Finish();
-		FMemory::Free(outs[0]);
-		FMemory::Free(outs[1]);
-		FMemory::Free(buff_bgr);
-		IsDestory = true;
+        avformat_network_deinit();
+        EncodeFinish();
+
+		FMemory::Free(SWSResampleOuts[0]);
+		FMemory::Free(SWSResampleOuts[1]);
+		FMemory::Free(VideoFrameBufferPtr);
+
+ 		IsDestory             = true;
+        IsConnected           = false;
+        VideoFrameBufferPtr   = nullptr;
 	}
 }
 
 void UFFmpegDirector::EndWindowReader(const bool i)
 {
-	DestoryDirector();
-	this->RemoveFromRoot();
-	this->ConditionalBeginDestroy();
-	this->BeginDestroy();
+    FinishDirector();
+	RemoveFromRoot();
+	ConditionalBeginDestroy();
+	BeginDestroy();
 }
 
-void UFFmpegDirector::EndWindowReader_StandardGame(void* i)
+void UFFmpegDirector::EndWindowReaderStandardGame(void* data)
 {
-	DestoryDirector();
-	this->RemoveFromRoot();
-	this->ConditionalBeginDestroy();
-	this->BeginDestroy();
+    FinishDirector();
+	RemoveFromRoot();
+	ConditionalBeginDestroy();
+	BeginDestroy();
 }
 
-void UFFmpegDirector::Begin_Receive_AudioData(UWorld* world)
+void UFFmpegDirector::RegisterAudioListener(UWorld* InWorld)
 {
-	GameMode = world->WorldType;
-	AudioDevice = world->GetAudioDevice();
+	GameMode    = InWorld->WorldType;
+	AudioDevice = InWorld->GetAudioDevice().GetAudioDevice();
 	if (AudioDevice)
 	{
 		AudioDevice->RegisterSubmixBufferListener(this);
 	}
 }
 
-void UFFmpegDirector::Initialize_Director(UWorld* World, FString OutFileName, bool UseGPU, FString VideoFilter, int VideoFps, int VideoBitRate, float AudioDelay, float SoundVolume)
+bool UFFmpegDirector::Initialize_Director(UWorld* InWorld, int32 InVideoLength, FString InFileName, bool InUseGPU, FString InVideoFilter, int InVideoFps, int InVideoBitRate, int InAudioBitRate, int InAudioSampleRate, float InAudioDelay, float InSoundVolume)
 {
-	avfilter_register_all();
-	av_register_all();
-	avformat_network_init();
+	World               = InWorld;
+	FileAddress         = InFileName;
 
-	audio_delay = AudioDelay;
-	video_fps = VideoFps;
-	Video_Tick_Time = float(1) / float(video_fps);
-	audio_volume = SoundVolume;
+    VideoCounter        = 0;
+    AudioCounter        = 0;
+	FrameCount          = 0;
+	TotalFrame          = InVideoLength;
 
-	gameWindow = GEngine->GameViewport->GetWindow().Get();
+    TickedTime          = 0;
+	AudioDelay          = InAudioDelay;
+	AudioVolume         = InSoundVolume;
+	VideoFps            = InVideoFps; 
+	VideoTickTime       = 1.f / VideoFps;
 
-	out_width = width = FormatSize_X(gameWindow->GetViewportSize().X);
-	out_height = height = gameWindow->GetViewportSize().Y;
+    IsTextured          = false;
+	SlateWindow         = GEngine->GameViewport->GetWindow().Get();
+	OutWidth            = Width  = FormatSize_X(SlateWindow->GetViewportSize().X);
+	OutHeight           = Height = SlateWindow->GetViewportSize().Y;
+    
+	VideoFrameBufferPtr = (uint8_t *)FMemory::Realloc(VideoFrameBufferPtr, 3 * Width * Height);
+    SWSResampleOuts[0]  = (uint8_t *)FMemory::Realloc(SWSResampleOuts[0], 4096);
+    SWSResampleOuts[1]  = (uint8_t *)FMemory::Realloc(SWSResampleOuts[1], 4096);
+    
+    if (avformat_network_init() < 0) 
+    {
+        UE_LOG(LogTemp, Log, TEXT("FFmpeg initialized network error!")); 
+        return false;
+    }
 
-	buff_bgr = (uint8_t *)FMemory::Realloc(buff_bgr, 3 * width *height);
-	outs[0] = (uint8_t *)FMemory::Realloc(outs[0], 4096);
-	outs[1] = (uint8_t *)FMemory::Realloc(outs[1], 4096);
-
-	FString Scale;
-	FString Resolution;
-
-	FString Str_width;
-	FString Str_height;
-	if (VideoFilter.Len() > 0)
+	if (InVideoFilter.Len() > 0)
 	{
-		VideoFilter.Split("=", &Scale, &Resolution);
-		Resolution.Split(":", &Str_width, &Str_height);
-		out_width= FCString::Atoi(*Str_width);
-		out_height= FCString::Atoi(*Str_height);
+	    FString StrWidth, StrHeight;
+        InVideoFilter.Split("x", &StrWidth, &StrHeight);
+		OutWidth       = FCString::Atoi(*StrWidth);
+		OutHeight      = FCString::Atoi(*StrHeight);
 	}
-	filter_descr.Append("[in]");
-	filter_descr.Append("scale=");
-	filter_descr.Append(FString::FromInt(out_width));
-	filter_descr.Append(":");
-	filter_descr.Append(FString::FromInt(out_height));
-	filter_descr.Append("[out]");
+	FilterDescription.Append("[in]");
+	FilterDescription.Append("scale=");
+	FilterDescription.Append(FString::FromInt(OutWidth));
+	FilterDescription.Append(":");
+	FilterDescription.Append(FString::FromInt(OutHeight));
+	FilterDescription.Append("[out]");
 
-	int IsUseRTMP = OutFileName.Find("rtmp");
-	if (IsUseRTMP==0)
+	IsUseRTMP = InFileName.Find("rtmp");
+	if (IsUseRTMP == 0)
 	{
-		if (avformat_alloc_output_context2(&out_format_context, NULL, "flv", TCHAR_TO_ANSI(*OutFileName)) < 0)
+		if (avformat_alloc_output_context2(&FormatContext, NULL, "flv", TCHAR_TO_ANSI(*InFileName)) < 0)
 		{
 			check(false);
 		}
 	}
 	else
 	{
-		if (avformat_alloc_output_context2(&out_format_context, NULL, NULL, TCHAR_TO_ANSI(*OutFileName)) < 0)
+		if (avformat_alloc_output_context2(&FormatContext, NULL, NULL, TCHAR_TO_ANSI(*InFileName)) < 0)
 		{
 			check(false);
 		}
 	}
+
 	//create audio encoder
-	Create_Audio_Swr();
-	Create_Audio_Encoder("aac");
+    CreateAudioSwresample(InAudioSampleRate);
+    CreateAudioEncoder("aac", InAudioBitRate, InAudioSampleRate);
 
 	//create video encoder
-	Create_Video_Encoder(UseGPU, TCHAR_TO_ANSI(*OutFileName), VideoBitRate);
-	Alloc_Video_Filter();
+    CreateVideoEncoder(InUseGPU, TCHAR_TO_ANSI(*InFileName), InVideoBitRate);
 
-	//create encode thread
-	CreateEncodeThread();
-
-	//bind delegate for get video data and audio data 
-	Begin_Receive_VideoData();
-	Begin_Receive_AudioData(World);
-
-	//End PIE deleate and tick delegate
-	AddEndFunction();
-	AddTickFunction();
+    return true;
 }
 
-void UFFmpegDirector::Begin_Receive_VideoData()
+void UFFmpegDirector::RegisterVideoDelegate()
 {
-	FSlateApplication::Get().GetRenderer()->OnBackBufferReadyToPresent().AddUObject(this, &UFFmpegDirector::OnBackBufferReady_RenderThread);
+    ResizeBackBufferHandle = FSlateApplication::Get().GetRenderer()->OnPostResizeWindowBackBuffer().AddUObject(this, &UFFmpegDirector::OnPostResizeBackBuffer);
+	BackBufferReadyHandle  = FSlateApplication::Get().GetRenderer()->OnBackBufferReadyToPresent().AddUObject(this, &UFFmpegDirector::OnBackBufferReady_RenderThread);
 }
 
-void UFFmpegDirector::OnBackBufferReady_RenderThread(SWindow& SlateWindow, const FTexture2DRHIRef& BackBuffer)
+void UFFmpegDirector::OnBackBufferReady_RenderThread(SWindow& InSlateWindow, const FTexture2DRHIRef& BackBuffer)
 {
-	if (gameWindow == &SlateWindow)
+    if (!IsClosing && (SlateWindow == &InSlateWindow))
+    {
+        if (TickedTime >= VideoTickTime)
+        {
+            GameTexture = BackBuffer;
+            if (!IsTextured)
+            {
+                CreateStateTexture();
+            }
+
+            if (FrameCount++ > TotalFrame)
+            {
+                if (IsUseRTMP != 0)
+                {
+                    IsClosing = true;
+                    StopCapture();
+                }
+            }
+
+            TickedTime -= VideoTickTime;
+            GrabSlateFrameData();
+        }
+    }
+}
+
+void UFFmpegDirector::OnPostResizeBackBuffer(void* Data)
+{
+    if (IsTextured) 
+    {
+        ResizeEncodeThread();
+    }
+}
+
+void UFFmpegDirector::StopCapture()
+{
+	//Remove the frame catch ticker, cause we don't need it now.
+	FTSTicker::GetCoreTicker().RemoveTicker(TickDelegateHandle);
+
+	//Bind a new ticker to check if the other thread finish the job;
+	CheckDelegateHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateUObject(this, &UFFmpegDirector::CheckThreadJobDone));
+}
+
+void UFFmpegDirector::Stop(UWorld* InWorld)
+{
+	FTSTicker::GetCoreTicker().RemoveTicker(CheckDelegateHandle);
+
+    Runnable->Stop();
+    RunnableThread->Kill(true);
+    SAFE_FREE(Runnable);
+
+	if (AudioDevice)
 	{
-		if (ticktime >= Video_Tick_Time)
+		AudioDevice->UnregisterSubmixBufferListener(this);
+	}
+
+    if (FSlateApplication::IsInitialized()) 
+    {
+		FSlateApplication::Get().GetRenderer()->OnBackBufferReadyToPresent().Remove(BackBufferReadyHandle);
+        FSlateApplication::Get().GetRenderer()->OnPostResizeWindowBackBuffer().Remove(ResizeBackBufferHandle);
+    }
+
+    EncodeFinish();
+
+	FMemory::Free(SWSResampleOuts[0]);
+	FMemory::Free(SWSResampleOuts[1]);
+	FMemory::Free(VideoFrameBufferPtr);
+}
+
+bool UFFmpegDirector::AddTickTime(float DeltaTime)
+{
+    if (IsMarkReceive) 
+    {
+        IsMarkReceive = false;
+        RegisterVideoDelegate();
+        RegisterAudioListener(World);
+    }
+
+	TickedTime += DeltaTime;
+	return true;
+}
+
+bool UFFmpegDirector::CheckThreadJobDone(float time)
+{
+	if (Runnable->IsQueneEmpty())
+	{
+		if (AudioCounter >= TotalFrame && VideoCounter >= TotalFrame)
 		{
-			GameTexture = BackBuffer;
-			ticktime -= Video_Tick_Time;
-			GetScreenVideoData();		
+			Stop(World);
 		}
 	}
-}
-
-bool UFFmpegDirector::AddTickTime(float time)
-{
-	ticktime += time;
 	return true;
 }
 
 void UFFmpegDirector::AddEndFunction()
 {
-	if(GameMode== EWorldType::Game)
-		FSlateApplication::Get().GetRenderer()->OnSlateWindowDestroyed().AddUObject(this, &UFFmpegDirector::EndWindowReader_StandardGame);
-		
-	if(GameMode == EWorldType::PIE)
-		FEditorDelegates::EndPIE.AddUObject(this, &UFFmpegDirector::EndWindowReader);
+	// Default End Function Logic, Stop when game thread end.
+	//if(GameMode== EWorldType::Game)
+		FSlateApplication::Get().GetRenderer()->OnSlateWindowDestroyed().AddUObject(this, &UFFmpegDirector::EndWindowReaderStandardGame);
+    // 		
+    // 	if(GameMode == EWorldType::PIE)
+    // 		FEditorDelegates::EndPIE.AddUObject(this, &UFFmpegDirector::EndWindowReader);
+    //
+	// Stop Recorder when get enough frame.
 }
 
 void UFFmpegDirector::AddTickFunction()
 {
-	TickDelegateHandle = FTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateUObject(this, &UFFmpegDirector::AddTickTime));
+	TickDelegateHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateUObject(this, &UFFmpegDirector::AddTickTime));
 }
 
-void UFFmpegDirector::GetScreenVideoData()
+void UFFmpegDirector::CreateStateTexture()
 {
-	FRHICommandListImmediate& list = GRHICommandList.GetImmediateCommandList();
-	uint8* TextureData = (uint8*)list.LockTexture2D(GameTexture->GetTexture2D(), 0, EResourceLockMode::RLM_ReadOnly, LolStride, false);
-	if(Runnable)
-		Runnable->InsertVideo(TextureData);
-	list.UnlockTexture2D(GameTexture, 0, false);
+    const FRHITextureCreateDesc CopyedTextureDesc =
+        FRHITextureCreateDesc::Create2D(TEXT("CopyedTexture"))
+        .SetFormat(GameTexture->GetFormat())
+        .SetInitialState(ERHIAccess::CopyDest)
+        .SetExtent(SlateWindow->GetViewportSize().X, SlateWindow->GetViewportSize().Y);
+
+    CopyedTexture = RHICreateTexture(CopyedTextureDesc);
+    IsTextured    = true;
+}
+
+void UFFmpegDirector::GrabSlateFrameData()
+{
+	FString RHIName = GDynamicRHI->GetName();
+    
+	// DirectX 11
+	// FRHICommandListImmediate::LockTexture2D() will cause crash in DirectX 12, use DirectX 11.
+	if (RHIName == TEXT("D3D11"))
+	{
+	    FRHICommandListImmediate& list = GRHICommandList.GetImmediateCommandList();
+		uint8* TextureData = (uint8*)list.LockTexture2D(GameTexture->GetTexture2D(), 0, EResourceLockMode::RLM_ReadOnly, LolStride, false);
+		if (Runnable) Runnable->InsertVideo(TextureData);
+		list.UnlockTexture2D(GameTexture, 0, false);
+	}
+	// DirectX 11 end
+
+	// DirectX 12 & Vulkan
+	if (RHIName == TEXT("D3D12") || RHIName == TEXT("Vulkan"))
+	{
+        ENQUEUE_RENDER_COMMAND(CopyRHITextureData)([this](FRHICommandListImmediate& RHICmdList)
+        {
+            RHICmdList.Transition(FRHITransitionInfo(this->GameTexture, ERHIAccess::Unknown, ERHIAccess::CopySrc));
+            RHICmdList.Transition(FRHITransitionInfo(this->CopyedTexture, ERHIAccess::Unknown, ERHIAccess::CopyDest));
+            RHICmdList.CopyTexture(this->GameTexture, this->CopyedTexture, FRHICopyTextureInfo());
+
+            // Send video data to ffmpeg
+            uint8* TextureData = (uint8*)RHICmdList.LockTexture2D(this->CopyedTexture, 0, EResourceLockMode::RLM_ReadOnly, this->LolStride, false);
+            if (this->Runnable) { this->Runnable->InsertVideo(TextureData); }
+            RHICmdList.UnlockTexture2D(this->CopyedTexture, 0, false);
+
+            RHICmdList.Transition(FRHITransitionInfo(this->GameTexture, ERHIAccess::CopySrc, ERHIAccess::Present));
+            RHICmdList.Transition(FRHITransitionInfo(this->CopyedTexture, ERHIAccess::CopyDest, ERHIAccess::CopySrc));
+         });
+	}
+	// DirectX 12 & Vulkan end
 }
 
 void UFFmpegDirector::CreateEncodeThread()
 {
 	Runnable = new FEncoderThread();
-	Runnable->CreateQueue(4 * width*height, 2048 * sizeof(float), 30, 40);
-	Runnable->GetAudioProcessDelegate().BindUObject(this, &UFFmpegDirector::Encode_Audio_Frame);
-	Runnable->video_encode_delegate.BindUObject(this, &UFFmpegDirector::Encode_Video_Frame);
-	Runnable->GetAudioTimeProcessDelegate().BindUObject(this, &UFFmpegDirector::Encode_SetCurrentAudioTime);
+	Runnable->CreateQueue(4 * Width * Height, 2048 * sizeof(float), 30, 40);
+	Runnable->GetAudioProcessDelegate().BindUObject(this, &UFFmpegDirector::EncodeAudioFrame);
+	Runnable->VideoEncodeDelegate.BindUObject(this, &UFFmpegDirector::EncodeVideoFrame);
+	Runnable->GetAudioTimeProcessDelegate().BindUObject(this, &UFFmpegDirector::SetAudioEncodeCurrentTime);
 	RunnableThread = FRunnableThread::Create(Runnable, TEXT("EncoderThread"));
 }
 
-void UFFmpegDirector::Create_Audio_Encoder(const char* audioencoder_name)
+void UFFmpegDirector::ResizeEncodeThread()
 {
-	AVCodec* audioencoder_codec;
-	audioencoder_codec = avcodec_find_encoder_by_name(audioencoder_name);
-	out_audio_stream = avformat_new_stream(out_format_context, audioencoder_codec);
-	audio_index = out_audio_stream->index;
-	audio_encoder_codec_context = avcodec_alloc_context3(audioencoder_codec);
+    if (IsClosing || !IsConnected) return;
 
-	if (!out_audio_stream)
-	{
-		check(false);
-	}
-	audio_encoder_codec_context->codec_id = AV_CODEC_ID_AAC;
-	audio_encoder_codec_context->bit_rate = 120000;
-	audio_encoder_codec_context->codec_type = AVMEDIA_TYPE_AUDIO;
-	audio_encoder_codec_context->sample_rate = 48000;
-	audio_encoder_codec_context->sample_fmt = AV_SAMPLE_FMT_FLTP;
-	audio_encoder_codec_context->channels = 2;
-	audio_encoder_codec_context->channel_layout = AV_CH_LAYOUT_STEREO;
+    //TODO: 窗口尺寸变化!!!
+    CreateStateTexture();
 
-	if (out_format_context->oformat->flags & AVFMT_GLOBALHEADER)
-		audio_encoder_codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    OutWidth  = Width   = FormatSize_X(SlateWindow->GetViewportSize().X);
+    OutHeight = Height  = SlateWindow->GetViewportSize().Y;
+    VideoFrameBufferPtr = (uint8_t*)FMemory::Realloc(VideoFrameBufferPtr, 3 * Width * Height);
+    SWSResampleOuts[0]  = (uint8_t*)FMemory::Realloc(SWSResampleOuts[0], 4096);
+    SWSResampleOuts[1]  = (uint8_t*)FMemory::Realloc(SWSResampleOuts[1], 4096);
 
-	audio_encoder_codec_context->codec_tag = 0;
-	out_audio_stream->codecpar->codec_tag = 0;
+    checkf(Runnable, TEXT("Thread error!"));
+    Runnable->PauseThread(true);
+    Runnable->Resize(4 * Width * Height, 2048 * sizeof(float));
 
-	if (avcodec_open2(audio_encoder_codec_context, audioencoder_codec, NULL) < 0)
-	{
-		check(false);
-	}
-	avcodec_parameters_from_context(out_audio_stream->codecpar, audio_encoder_codec_context);
+    int Result = av_image_alloc(VideoFrame->data, VideoFrame->linesize, OutWidth, OutHeight, VideoCodecContext->pix_fmt, 32);
+    if (Result < 0)
+    {
+        check(false);
+    }
 
-	audio_frame = av_frame_alloc();
-	audio_frame->nb_samples = audio_encoder_codec_context->frame_size;
-	audio_frame->format = audio_encoder_codec_context->sample_fmt;
+    {
+        SWSResampleContext = sws_getCachedContext(SWSResampleContext, Width, Height, AV_PIX_FMT_BGR24, OutWidth, OutHeight, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, 0, 0, 0);
+    }
+
+    //CreateVideoGraphFilter();
+
+    Runnable->PauseThread(false);
 }
 
-void UFFmpegDirector::Create_Video_Encoder(bool is_use_NGPU, const char* out_file_name, int bit_rate)
+void UFFmpegDirector::CreateAudioEncoder(const char* EncoderName, int BitRate, int SampleRate)
 {
-	AVCodec *encoder_codec;
-	int ret;
+	const AVCodec* AudioCodec;
 
-	if (is_use_NGPU)
-	{
-		encoder_codec = avcodec_find_encoder_by_name("nvenc_h264");
-	}
-	else
-	{
-		encoder_codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-	}
-	if (!encoder_codec)
-	{
-		check(false);
-	}
-	out_video_stream = avformat_new_stream(out_format_context, encoder_codec);
+    AudioCodec        = avcodec_find_encoder_by_name(EncoderName);
+	AudioStream       = avformat_new_stream(FormatContext, AudioCodec);
+	AudioStreamIndex  = AudioStream->index;
+	AudioCodecContext = avcodec_alloc_context3(AudioCodec);
+	if (!AudioStream) { check(false); }
 
-	video_index = out_video_stream->index;
+	AudioCodecContext->codec_id    = AV_CODEC_ID_AAC;
+	AudioCodecContext->bit_rate    = BitRate;
+	AudioCodecContext->codec_type  = AVMEDIA_TYPE_AUDIO;
+	AudioCodecContext->sample_rate = SampleRate;
+	AudioCodecContext->sample_fmt  = AV_SAMPLE_FMT_FLTP;
+	AudioCodecContext->channels    = 2;
+	AudioCodecContext->channel_layout = AV_CH_LAYOUT_STEREO;
 
-	video_encoder_codec_context = avcodec_alloc_context3(encoder_codec);
-	if (!video_encoder_codec_context)
-	{
-		check(false);
-	}
-	video_encoder_codec_context->bit_rate = bit_rate;
-	//video_encoder_codec_context->rc_min_rate = bit_rate;
-	//video_encoder_codec_context->rc_max_rate = bit_rate;
-	//video_encoder_codec_context->bit_rate_tolerance = bit_rate;
-	//video_encoder_codec_context->rc_buffer_size = bit_rate;
-	//video_encoder_codec_context->rc_initial_buffer_occupancy = bit_rate * 3 / 4;
-	video_encoder_codec_context->width = out_width;
-	video_encoder_codec_context->height = out_height;
-	video_encoder_codec_context->max_b_frames = 2;
-	video_encoder_codec_context->time_base.num = 1;
-	video_encoder_codec_context->time_base.den = video_fps;
-	video_encoder_codec_context->pix_fmt = AV_PIX_FMT_YUV420P;
-	video_encoder_codec_context->me_range = 16;
-	video_encoder_codec_context->codec_type = AVMEDIA_TYPE_VIDEO;
-	video_encoder_codec_context->profile = FF_PROFILE_H264_BASELINE;
-	video_encoder_codec_context->frame_number = 1;
-	video_encoder_codec_context->qcompress = 0.8;
-	video_encoder_codec_context->max_qdiff = 4;
-	video_encoder_codec_context->level = 30;
-	video_encoder_codec_context->gop_size = 25;
-	video_encoder_codec_context->qmin = 18;
-	video_encoder_codec_context->qmax = 28;
-	video_encoder_codec_context->me_range = 16;
-	video_encoder_codec_context->framerate = { video_fps,1 };
+	if (FormatContext->oformat->flags & AVFMT_GLOBALHEADER)
+		AudioCodecContext->flags    |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-	//ultrafast,superfast, veryfast, faster, fast, medium, slow, slower, veryslow,placebo.
-	if (encoder_codec)
-		av_opt_set(video_encoder_codec_context->priv_data, "preset", "fast",
-			0);
-
-	if (out_format_context->oformat->flags & AVFMT_GLOBALHEADER)
-		video_encoder_codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-	int i = avcodec_open2(video_encoder_codec_context, encoder_codec, NULL);
-	if (i < 0)
+	AudioCodecContext->codec_tag     = 0;
+	AudioStream->codecpar->codec_tag = 0;
+	if (avcodec_open2(AudioCodecContext, AudioCodec, NULL) < 0)
 	{
 		check(false);
 	}
+	avcodec_parameters_from_context(AudioStream->codecpar, AudioCodecContext);
 
-	ret = avcodec_parameters_from_context(out_video_stream->codecpar, video_encoder_codec_context);
-	if (ret < 0)
-	{
-		check(false);
-	}
-
-	video_frame = av_frame_alloc();
-	if (!video_frame)
-	{
-		check(false);
-	}
-
-	avio_open(&out_format_context->pb, out_file_name, AVIO_FLAG_WRITE);
-	ret = av_image_alloc(
-		video_frame->data,
-		video_frame->linesize,
-		out_width,
-		out_height,
-		video_encoder_codec_context->pix_fmt,
-		32);
-	if (ret < 0)
-	{
-		check(false);
-	}
-
-	sws_context = sws_getCachedContext(sws_context,
-		width, height, AV_PIX_FMT_BGR24,
-		out_width, out_height, AV_PIX_FMT_YUV420P,
-		SWS_FAST_BILINEAR, 0, 0, 0);
-
-	if (avformat_write_header(out_format_context, NULL) < 0)
-	{
-		check(false);
-	}
-
-	Video_Frame_Duration = out_video_stream->time_base.den / video_fps;
+	AudioFrame                 = av_frame_alloc();
+	AudioFrame->format         = AudioCodecContext->sample_fmt;
+	AudioFrame->nb_samples     = AudioCodecContext->frame_size;
+    AudioFrame->channels       = AudioCodecContext->channels;
+    AudioFrame->channel_layout = AudioCodecContext->channel_layout;
 }
 
-void UFFmpegDirector::Video_Frame_YUV_From_BGR(uint8_t *rgb)
+bool UFFmpegDirector::CreateVideoEncoder(bool UseNvidiaGPU, const char* FileName, int BitRate)
 {
-	const int in_linesize[1] = { 3 * width };
-	sws_scale(sws_context, (const uint8_t * const *)&rgb, in_linesize, 0,
-		height, video_frame->data, video_frame->linesize);
-	video_frame->width = out_width;
-	video_frame->height = out_height;
-	video_frame->format = AV_PIX_FMT_YUV420P;
+	const AVCodec* VideoCodec;
+
+    if (!UseNvidiaGPU)
+    {
+        VideoCodec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    }
+    else
+    {
+        //H265编解码器压缩率很高，但测试了RTMP协议VLCPlayer播放器不支持，所以放弃了H265编解码器
+        //H266技术刚出来，更不行! AV_CODEC_ID_H265: hevc_nvenc, AV_CODEC_ID_H266
+        VideoCodec = avcodec_find_encoder_by_name("h264_nvenc");
+        if (!VideoCodec && UseNvidiaGPU)
+        {
+            UE_LOG(LogTemp, Log, TEXT("FFmpeg create encoder/decoder error with nvidia driver! please install version[560.70-desktop-win10-win11-64bit-international-nsd-dch-whql]"));
+            return false;
+        }
+    }
+
+	VideoStream       = avformat_new_stream(FormatContext, VideoCodec);
+	VideoStreamIndex  = VideoStream->index;
+
+	VideoCodecContext = avcodec_alloc_context3(VideoCodec);
+	if (!VideoCodecContext)
+	{
+		check(false);
+	}
+
+	VideoCodecContext->bit_rate      = BitRate;
+    //VideoCodecContext->rc_min_rate = bit_rate;
+	//VideoCodecContext->rc_max_rate = bit_rate;
+	//VideoCodecContext->bit_rate_tolerance = bit_rate;
+	//VideoCodecContext->rc_buffer_size     = bit_rate;
+	//VideoCodecContext->rc_initial_buffer_occupancy = bit_rate * 3 / 4;
+	VideoCodecContext->width         = OutWidth;
+	VideoCodecContext->height        = OutHeight;
+	VideoCodecContext->max_b_frames  = 2;
+	VideoCodecContext->time_base.num = 1;
+	VideoCodecContext->time_base.den = VideoFps;
+	VideoCodecContext->pix_fmt       = AV_PIX_FMT_YUV420P;
+	VideoCodecContext->me_range      = 16;
+	VideoCodecContext->codec_type    = AVMEDIA_TYPE_VIDEO;
+	VideoCodecContext->profile       = FF_PROFILE_H264_HIGH;
+	VideoCodecContext->frame_num     = 1;
+	VideoCodecContext->qcompress     = 1;
+	VideoCodecContext->max_qdiff     = 4;
+	VideoCodecContext->level         = 30;
+	VideoCodecContext->gop_size      = 25;
+	VideoCodecContext->qmin          = 18;
+	VideoCodecContext->qmax          = 28;
+	VideoCodecContext->me_range      = 16;
+	VideoCodecContext->framerate     = { VideoFps, 1 };
+
+	//ultrafast,superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo.
+    if (VideoCodec)
+    {
+		av_opt_set(VideoCodecContext->priv_data, "preset", "fast", 0);
+    }
+
+    if (FormatContext->oformat->flags & AVFMT_GLOBALHEADER) 
+    {
+		VideoCodecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+	int Result = avcodec_open2(VideoCodecContext, VideoCodec, NULL);
+	if (Result < 0)
+	{
+		check(false);
+	}
+
+	Result = avcodec_parameters_from_context(VideoStream->codecpar, VideoCodecContext);
+	if (Result < 0)
+	{
+		check(false);
+	}
+
+	VideoFrame = av_frame_alloc();
+	if (!VideoFrame)
+	{
+		check(false);
+	}
+
+	Result = av_image_alloc(VideoFrame->data, VideoFrame->linesize, OutWidth, OutHeight, VideoCodecContext->pix_fmt, 32);
+	if (Result < 0)
+	{
+		check(false);
+	}
+
+    Async(EAsyncExecution::ThreadIfForkSafe, [this]()
+    {
+        ConnectedDelegate.AddDynamic(this, &UFFmpegDirector::OnConnectedServerCallback);
+
+        int Result = avio_open(&this->FormatContext->pb, TCHAR_TO_ANSI(*this->FileAddress), AVIO_FLAG_WRITE);
+        if (ConnectedDelegate.IsBound()) ConnectedDelegate.Broadcast(Result >= 0);
+    });
+
+    return true;
 }
 
-void UFFmpegDirector::Create_Audio_Swr()
+void UFFmpegDirector::OnConnectedServerCallback(bool Connected)
 {
-	swr = swr_alloc();
-	av_opt_set_int(swr, "in_channel_layout", AV_CH_LAYOUT_STEREO, 0);
-	av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
-	av_opt_set_int(swr, "in_sample_rate", 48000, 0);
-	av_opt_set_int(swr, "out_sample_rate", 48000, 0);
-	av_opt_set_sample_fmt(swr, "in_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
-	av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_FLTP, 0);
-	swr_init(swr);
+    this->IsConnected = !IsUseRTMP ? Connected : false;
+    ConnectedDelegate.RemoveDynamic(this, &UFFmpegDirector::OnConnectedServerCallback);
+
+    if (!Connected) 
+    {
+        FinishDirector();
+    }
+    else
+    {
+        if (avformat_write_header(FormatContext, NULL) < 0)
+        {
+            check(false);
+        }
+
+        IsMarkReceive      = true;
+        FrameDuration      = VideoStream->time_base.den / VideoFps;
+        SWSResampleContext = sws_getCachedContext(SWSResampleContext, Width, Height, AV_PIX_FMT_BGR24, OutWidth, OutHeight, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, 0, 0, 0);
+
+        // allocate graph filter 
+        CreateVideoGraphFilter();
+ 
+        //create encode thread
+        CreateEncodeThread();
+
+        //add tick functions
+        AddTickFunction();
+    }
+}
+
+void UFFmpegDirector::ScaleVideoFrame(uint8_t* RGB)
+{
+	const int LineSize[1] = { 3 * (int)Width };
+	sws_scale(SWSResampleContext, (const uint8_t * const *)&RGB, LineSize, 0, Height, VideoFrame->data, VideoFrame->linesize);
+
+	VideoFrame->width  = OutWidth;
+	VideoFrame->height = OutHeight;
+	VideoFrame->format = AV_PIX_FMT_YUV420P;
+}
+
+void UFFmpegDirector::CreateAudioSwresample(int sample_rate)
+{
+	SWResample = swr_alloc();
+	av_opt_set_int(SWResample, "in_channel_layout",   AV_CH_LAYOUT_STEREO,  0);
+	av_opt_set_int(SWResample, "out_channel_layout",  AV_CH_LAYOUT_STEREO,  0);
+	av_opt_set_int(SWResample, "in_sample_rate",     /*48000*/sample_rate,  0);
+	av_opt_set_int(SWResample, "out_sample_rate",    /*48000*/sample_rate,  0);
+	av_opt_set_sample_fmt(SWResample, "in_sample_fmt",  AV_SAMPLE_FMT_FLT,  0);
+	av_opt_set_sample_fmt(SWResample, "out_sample_fmt", AV_SAMPLE_FMT_FLTP, 0);
+	swr_init(SWResample);
 }
 
 void UFFmpegDirector::OnNewSubmixBuffer(const USoundSubmix* OwningSubmix, float* AudioData, int32 NumSamples, int32 NumChannels, const int32 SampleRate, double AudioClock)
 {
-	if(Runnable)
-		Runnable->InsertAudio((uint8_t*)AudioData, (uint8_t*)&AudioClock);
+    if (Runnable) 
+    {
+        //AudioCodecContext->bit_rate  = bit_rate;
+        AudioCodecContext->sample_rate = SampleRate;
+        AudioCodecContext->channels    = NumChannels;
+
+        av_opt_set_int(SWResample,  "in_sample_rate", SampleRate, 0);
+        av_opt_set_int(SWResample, "out_sample_rate", SampleRate, 0);
+
+		Runnable->InsertAudio((uint8_t*)AudioData, &AudioClock);
+    }
 }
 
-void UFFmpegDirector::Encode_Audio_Frame(uint8_t *rgb)
+void UFFmpegDirector::EncodeAudioFrame(uint8_t* InAudioData)
 {
-	const uint8_t* data = rgb;
-	AVPacket* audio_pkt = av_packet_alloc();
-	av_init_packet(audio_pkt);
-	int count = swr_convert(swr, outs, 4096, &data, 1024);
-	int got_output = 0;
+    static int64 FirstSendPts = 0;
 
-	audio_frame->data[0] = (uint8_t*)outs[0];
-	audio_frame->data[1] = (uint8_t*)outs[1];
-	Set_Audio_Volume(audio_frame);
+    if (!AudioLastSendPts) 
+    {
+        AudioLastSendPts = GetUtcNowMissisecond();
+        if (!FirstSendPts) 
+        {
+            FirstSendPts = GetUtcNowMissisecond();
+        }
 
-	if (avcodec_encode_audio2(audio_encoder_codec_context, audio_pkt, audio_frame, &got_output) < 0)
+        return;
+    }
+
+	const uint8_t* AudioData = InAudioData;
+	AVPacket* AudioPkt  = av_packet_alloc();
+
+	av_init_packet(AudioPkt);
+	swr_convert(SWResample, SWSResampleOuts, 4096, &AudioData, 1024);
+
+	AudioFrame->data[0] = (uint8_t*)SWSResampleOuts[0];
+	AudioFrame->data[1] = (uint8_t*)SWSResampleOuts[1];
+    SetAudioChannelData(AudioFrame);
+
+	if (avcodec_send_frame(AudioCodecContext, AudioFrame) < 0)
 	{
 		check(false);
 	}
-	if (got_output)
+
+	int Result = avcodec_receive_packet(AudioCodecContext, AudioPkt);
+	if (Result < 0 && Result != -11)
 	{
-		audio_pkt->pts = audio_pkt->dts = av_rescale_q(
-			(CurrentAuidoTime + audio_delay) / av_q2d({ 1,48000 }),
-			{ 1,48000 },
-			out_audio_stream->time_base);
-
-		audio_pkt->duration = av_rescale_q(
-			audio_pkt->duration,
-			{ 1,48000 },
-			out_audio_stream->time_base);
-
-		audio_pkt->stream_index = audio_index;
-		av_write_frame(out_format_context, audio_pkt);
-		av_packet_unref(audio_pkt);
+		check(false);
 	}
+
+	if (AudioPkt->size != 0)
+	{
+        //const int AudioBitRate = (int)AudioCodecContext->bit_rate;
+        //AudioPkt->duration     = av_rescale_q(AudioPkt->duration, { 1, AudioBitRate }, AudioStream->time_base);
+		//AudioPkt->pts          = AudioPkt->dts = av_rescale_q((/*pass_time*/CurrentTime + AudioDelay) / av_q2d({1, AudioBitRate}), {1, AudioBitRate}, AudioStream->time_base);
+
+        AudioPkt->stream_index   = AudioStreamIndex;
+        AudioPkt->duration       = GetUtcNowMissisecond() - AudioLastSendPts;
+        AudioPkt->pts            = AudioPkt->dts = GetUtcNowMissisecond() - FirstSendPts;
+
+		av_write_frame(FormatContext, AudioPkt);
+		av_packet_unref(AudioPkt);
+
+        AudioLastSendPts         = GetUtcNowMissisecond();
+	}
+
+    AudioCounter++;
 }
 
-void UFFmpegDirector::Encode_Video_Frame(uint8_t *rgb)
+void UFFmpegDirector::EncodeVideoFrame(uint8_t *VideoFrameData)
 {
-	uint32 Row = 0;
-	uint32 Col = 0;
-	uint8* TextureDataPtr=rgb;
-	uint8_t* Firset_ptr = buff_bgr;
-	AVPacket* video_pkt = av_packet_alloc();
-	av_init_packet(video_pkt);
-	for (Row = 0; Row < height; ++Row)
+    static int64 FirstSendPts = 0;
+
+    if (!VideoLastSendPts)
+    {
+        VideoLastSendPts = GetUtcNowMissisecond();
+        if (!FirstSendPts)
+        {
+            FirstSendPts = GetUtcNowMissisecond();
+        }
+
+        return;
+    }
+
+	AVPacket* VideoPkt = av_packet_alloc();
+	if (VideoPkt) av_init_packet(VideoPkt);
+
+    //TODO: 可以使用parall处理!!!
+    uint32 Row = 0,   Col  = 0;
+	uint8* TextureDataPtr  = VideoFrameData;
+	uint8_t* BufferHeadPtr = VideoFrameBufferPtr;
+	for (Row = 0; Row < Height; ++Row)
 	{
-		uint32* PixelPtr = (uint32*)TextureDataPtr;
-		for (Col = 0; Col < width; ++Col)
+	    uint32* PixelPtr   = (uint32*)TextureDataPtr;
+		for (Col = 0; Col < Width; ++Col)
 		{
-			uint32 EncodedPixel = *PixelPtr;
-			//	AV_PIX_FMT_BGR24	这里暂时转换为BGR
-			//	AV_PIX_FMT_RGB24	掉帧严重 暂时不知道为什么
-			*(buff_bgr + 2) = (EncodedPixel >> 2) & 0xFF;
-			*(buff_bgr + 1) = (EncodedPixel >> 12) & 0xFF;
-			*(buff_bgr) = (EncodedPixel >> 22) & 0xFF;
-			buff_bgr += 3;
+			// AV_PIX_FMT_BGR24	这里暂时转换为BGR
+			// AV_PIX_FMT_RGB24	掉帧严重 暂时不知道为什么!
+            uint32 EncodedPixel            = *PixelPtr;
+			*(VideoFrameBufferPtr + 2)     = (EncodedPixel >> 2 ) & 0xFF;
+			*(VideoFrameBufferPtr + 1)     = (EncodedPixel >> 12) & 0xFF;
+			*(VideoFrameBufferPtr + 0)     = (EncodedPixel >> 22) & 0xFF;
+			VideoFrameBufferPtr           += 3;
 			++PixelPtr;		
 		}
 		TextureDataPtr += LolStride;
 	}
-	buff_bgr = Firset_ptr;
 
-	int got_output = 0;
-	Video_Frame_YUV_From_BGR(buff_bgr);
-	video_frame->pts = video_pts;
+	VideoFrameBufferPtr = BufferHeadPtr;
+    ScaleVideoFrame(VideoFrameBufferPtr);
 
-	AVFrame* filt_frame = av_frame_alloc();
-
-	if (av_buffersrc_add_frame_flags(buffersrc_ctx, video_frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
+    AVFrame* FilterFrame = av_frame_alloc();
+	if (av_buffersrc_add_frame_flags(BufferSource, VideoFrame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
 	{
-		check(false);
+        check(false);
 	}
-	while (1)
+
+	while (true)
 	{
-		int ret = av_buffersink_get_frame(buffersink_ctx, filt_frame);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-			break;
-		if (ret < 0)
-			break;
-		if (ret >= 0)
+        int Result = av_buffersink_get_frame(BufferSink, FilterFrame);
+        if (Result == AVERROR(EAGAIN) || Result == AVERROR_EOF || Result < 0) 
+        {
+            break;
+        }
+
+        int SndResult = avcodec_send_frame(VideoCodecContext, FilterFrame);
+        if (SndResult < 0)
+        {
+            //UE_LOG(LogTemp, Log, TEXT("======avcodec_send_frame() error!")); 
+        }
+
+	    while (Result >= 0)
 		{
-			avcodec_send_frame(video_encoder_codec_context, filt_frame);
-			while (ret >= 0)
-			{
-				ret = avcodec_receive_packet(video_encoder_codec_context, video_pkt);
-				if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-				{
-					av_packet_unref(video_pkt);
-					break;
-				}
-				else if (ret < 0)
-				{
-					av_packet_unref(video_pkt);
-					break;
-				}
-				video_pkt->stream_index = video_index;
-				video_pkt->pts = video_pkt->dts = video_frame->pts*Video_Frame_Duration;
-				video_pkt->stream_index = video_index;
-				video_pkt->duration = Video_Frame_Duration;
-				++video_pts;
-				av_write_frame(out_format_context, video_pkt);
+            Result = avcodec_receive_packet(VideoCodecContext, VideoPkt);
+            if (Result == AVERROR(EAGAIN) || Result == AVERROR_EOF || Result < 0)
+            {
+                av_packet_unref(VideoPkt);
+                break;
 			}
-			av_packet_unref(video_pkt);
+
+            const int64 NowMissisecond = GetUtcNowMissisecond();
+            VideoPkt->duration         = NowMissisecond - VideoLastSendPts;
+            VideoPkt->pts              = VideoPkt->dts  = NowMissisecond - FirstSendPts;
+            VideoPkt->stream_index     = VideoStreamIndex;
+
+            if (av_write_frame(FormatContext, VideoPkt) < 0)
+            {
+                UE_LOG(LogTemp, Log, TEXT("av_write_frame() error!"));
+            }
+
+            VideoLastSendPts           = GetUtcNowMissisecond();
 		}
+		av_packet_unref(VideoPkt);
 	}
-	av_frame_unref(filt_frame);	
+
+    VideoCounter++;
+	av_frame_unref(FilterFrame);
 }
 
-void UFFmpegDirector::Encode_SetCurrentAudioTime(uint8_t* rgb)
+void UFFmpegDirector::SetAudioEncodeCurrentTime(double* Time)
 {
-	CurrentAuidoTime = *(double*)rgb;
+    CurrentTime = *Time;
 }
 
-void UFFmpegDirector::Set_Audio_Volume(AVFrame *frame)
+void UFFmpegDirector::SetAudioChannelData(AVFrame *Frame)
 {
-	int i = 0;
-	float *ch_left = (float *)frame->data[0];
-	float *ch_right = (float *)frame->data[1];
-	for (i = 0; i < frame->nb_samples; i++)
+	float *LeftChannel   = (float *)Frame->data[0];
+	float *RightChannel  = (float *)Frame->data[1];
+	for (int i = 0; i < Frame->nb_samples; i++)
 	{
-		ch_left[i] *= audio_volume;
-		ch_right[i] *= audio_volume;
+		LeftChannel [i] *= AudioVolume;
+		RightChannel[i] *= AudioVolume;
 	}
 }
 
-void UFFmpegDirector::Alloc_Video_Filter()
+void UFFmpegDirector::CreateVideoGraphFilter()
 {
-	outputs = avfilter_inout_alloc();
-	inputs = avfilter_inout_alloc();
-	const AVFilter *buffersrc = avfilter_get_by_name("buffer");
-	const AVFilter *buffersink = avfilter_get_by_name("buffersink");
-	enum AVPixelFormat pix_fmts[] = { video_encoder_codec_context->pix_fmt, AV_PIX_FMT_NONE };
-	AVRational time_base = {1,1000000};
-	int ret = 0;
+	FilterGraph   = avfilter_graph_alloc();
+	FilterInputs  = avfilter_inout_alloc();
+	FilterOutputs = avfilter_inout_alloc();
+	if (!FilterGraph || !FilterInputs || !FilterOutputs) 
+    {
+        check(false); 
+    }
 
-	filter_graph = avfilter_graph_alloc();
-	if (!outputs || !inputs || !filter_graph)
+	char  FilterArgs[100];
+    const AVRational NewTimeBase  = { 1, 1000000 };
+    const AVFilter*  FilterSource = avfilter_get_by_name("buffer");
+    const AVFilter*  FilterSink   = avfilter_get_by_name("buffersink");
+    enum  AVPixelFormat PixelFormat[] = { VideoCodecContext->pix_fmt, AV_PIX_FMT_NONE };
+
+	snprintf(FilterArgs, sizeof(FilterArgs), "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d", VideoCodecContext->width, VideoCodecContext->height, VideoCodecContext->pix_fmt, NewTimeBase.num, NewTimeBase.den, VideoCodecContext->sample_aspect_ratio.num, VideoCodecContext->sample_aspect_ratio.den);
+	int Result = avfilter_graph_create_filter(&BufferSource, FilterSource, "in", FilterArgs, NULL, FilterGraph);
+	if (Result < 0)
 	{
 		check(false);
 	}
 
-	char args[100];
-	snprintf(args, sizeof(args),
-		"video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-		video_encoder_codec_context->width, video_encoder_codec_context->height, video_encoder_codec_context->pix_fmt,
-		time_base.num, time_base.den,
-		video_encoder_codec_context->sample_aspect_ratio.num, video_encoder_codec_context->sample_aspect_ratio.den);
-
-	ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in",
-		args, NULL, filter_graph);
-	if (ret < 0)
-	{
-		check(false);
-	}
-	ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out",
-		NULL, NULL, filter_graph);
-	if (ret < 0)
+	Result = avfilter_graph_create_filter(&BufferSink, FilterSink, "out", NULL, NULL, FilterGraph);
+	if (Result < 0)
 	{
 		check(false);
 	}
 
-	ret = av_opt_set_int_list(buffersink_ctx, "pix_fmts", pix_fmts,
-		AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
-	if (ret < 0)
+	Result = av_opt_set_int_list(BufferSink, "pix_fmts", PixelFormat, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+	if (Result < 0)
 	{
 		check(false);
 	}
 
-	outputs->name = av_strdup("in");
-	outputs->filter_ctx = buffersrc_ctx;
-	outputs->pad_idx = 0;
-	outputs->next = NULL;
+	FilterOutputs->name       = av_strdup("in");
+	FilterOutputs->filter_ctx = BufferSource;
+	FilterOutputs->pad_idx    = 0;
+	FilterOutputs->next       = NULL;
 
-	inputs->name = av_strdup("out");
-	inputs->filter_ctx = buffersink_ctx;
-	inputs->pad_idx = 0;
-	inputs->next = NULL;
+	FilterInputs->name        = av_strdup("out");
+	FilterInputs->filter_ctx  = BufferSink;
+	FilterInputs->pad_idx     = 0;
+	FilterInputs->next        = NULL;
 
-	if ((ret = avfilter_graph_parse_ptr(filter_graph, TCHAR_TO_ANSI(*filter_descr),
-		&inputs, &outputs, NULL)) < 0)
+	if ((Result = avfilter_graph_parse_ptr(FilterGraph, TCHAR_TO_ANSI(*FilterDescription), &FilterInputs, &FilterOutputs, NULL)) < 0)
 	{
 		check(false);
 	}
-	if ((ret = avfilter_graph_config(filter_graph, NULL)) < 0)
+
+	if ((Result = avfilter_graph_config(FilterGraph, NULL)) < 0)
 	{
 		check(false);
 	}
@@ -597,39 +823,42 @@ uint32 UFFmpegDirector::FormatSize_X(uint32 x)
 	return x;
 }
 
-void UFFmpegDirector::Encode_Finish()
+void UFFmpegDirector::EncodeFinish()
 {
-	if (out_format_context)
+	if (FormatContext)
 	{
-		av_write_trailer(out_format_context);
-		avio_close(out_format_context->pb);
-		avformat_free_context(out_format_context);
+		if (IsConnected) av_write_trailer(FormatContext);
+		if (IsConnected) avio_close(FormatContext->pb);
+		avformat_free_context(FormatContext);
 	}
 
-	if (video_encoder_codec_context)
+	if (VideoCodecContext)
 	{
-		avcodec_free_context(&video_encoder_codec_context);
-		avcodec_close(video_encoder_codec_context);
-		av_free(video_encoder_codec_context);
+		avcodec_free_context(&VideoCodecContext);
+		if (IsConnected) avcodec_close(VideoCodecContext);
+		av_free(VideoCodecContext);
 	}
 
-	if (audio_encoder_codec_context)
+	if (AudioCodecContext)
 	{
-		avcodec_free_context(&audio_encoder_codec_context);
-		avcodec_close(audio_encoder_codec_context);
-		av_free(audio_encoder_codec_context);
+		avcodec_free_context(&AudioCodecContext);
+		if (IsConnected) avcodec_close(AudioCodecContext);
+		av_free(AudioCodecContext);
 	}
-	if (swr)
+	if (SWResample)
 	{
-		swr_close(swr);
-		swr_free(&swr);
-		sws_freeContext(sws_context);
+		swr_close(SWResample);
+		swr_free(&SWResample);
+		sws_freeContext(SWSResampleContext);
 	}
 
-	avfilter_graph_free(&filter_graph);
-	avfilter_inout_free(&inputs);
-	avfilter_inout_free(&outputs);
+    if (IsConnected) 
+    {
+	    avfilter_graph_free(&FilterGraph);
+	    avfilter_inout_free(&FilterInputs);
+	    avfilter_inout_free(&FilterOutputs);
+    }
 
-	av_frame_free(&video_frame);
-	av_frame_free(&audio_frame);
+	av_frame_free(&VideoFrame);
+	av_frame_free(&AudioFrame);
 }

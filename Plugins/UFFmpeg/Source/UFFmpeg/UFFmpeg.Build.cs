@@ -1,55 +1,48 @@
 // Copyright 1998-2019 Epic Games, Inc. All Rights Reserved.
 
-using UnrealBuildTool;
 using System.IO;
+
+using UnrealBuildTool;
+
 public class UFFmpeg : ModuleRules
 {
-    private string ModulePath
-    {
-        get { return ModuleDirectory; }
-    }
-    private string ThirdPartyPath
-    {
-        get { return Path.GetFullPath(Path.Combine(ModulePath, "../../ThirdParty")); }
-    }
-    private string ProjectPath
-    {
-        get { return Directory.GetParent(ModulePath).Parent.FullName; }
-    }
+    private string ModulePath { get { return ModuleDirectory; } }
+    private string ProjectPath { get { return Directory.GetParent(ModulePath).Parent.FullName; } }
+    private string ThirdPartyPath { get { return Path.GetFullPath(Path.Combine(ModulePath, "../../ThirdParty/ffmpeg-6.2.r113110")); } }
 
     public UFFmpeg(ReadOnlyTargetRules Target) : base(Target)
     {
+        //bEnableUndefinedIdentifierWarnings = false;
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+        OptimizeCode = CodeOptimization.InShippingBuildsOnly;
 
-        if ((Target.Platform == UnrealTargetPlatform.Win64) || (Target.Platform == UnrealTargetPlatform.Win32))
+        PublicIncludePaths.Add(Path.Combine(ThirdPartyPath, "include"));
+        PublicIncludePaths.Add(Path.Combine(Directory.GetCurrentDirectory(), "Runtime","AudioMixer","Private"));
+
+        PublicDependencyModuleNames .AddRange(new string[] { "Core", "AudioMixer" });
+        PrivateDependencyModuleNames.AddRange(new string[] { "CoreUObject", "Core", "Engine", "Slate", "SlateCore", "Projects", "Engine", "RHI", "RHICore", "RenderCore" });
+
+        if (Target.Platform == UnrealTargetPlatform.Win64)
         {
+            string[] libraries = { "avcodec.lib", "avdevice.lib", "avfilter.lib", "avformat.lib", "avutil.lib", "swresample.lib", "swscale.lib" };
+            string LibrariesPath = Path.Combine(ThirdPartyPath, "lib");
+            foreach (string library in libraries)
+            {
+                PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, library));
+            }
 
-            string PlatformString = (Target.Platform == UnrealTargetPlatform.Win64) ? "x64" : "Win32";
-            string LibrariesPath = Path.Combine(Path.Combine(Path.Combine(ThirdPartyPath, "ffmpeg", "lib"), "vs"), PlatformString);    
-
-            PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, "avcodec.lib"));
-            PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, "avdevice.lib"));
-            PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, "avfilter.lib"));
-            PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, "avformat.lib"));
-            PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, "avutil.lib"));
-            PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, "swresample.lib"));
-            PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, "swscale.lib"));
-
-            string[] dlls = { "avcodec-58.dll", "avdevice-58.dll", "avfilter-7.dll", "avformat-58.dll", "avutil-56.dll", "swresample-3.dll", "swscale-5.dll", "postproc-55.dll" };
-
-            string BinariesPath = Path.Combine(Path.Combine(Path.Combine(ThirdPartyPath, "ffmpeg", "bin"), "vs"), PlatformString);
-            System.Console.WriteLine("... LibrariesPath -> " + BinariesPath);
+            string[] dlls = { "avcodec.dll", "avdevice.dll", "avfilter.dll", "avformat.dll", "avutil.dll", "swresample.dll", "swscale.dll", "postproc.dll" };
+            string BinariesPath = Path.Combine(ThirdPartyPath, "bin");
             foreach (string dll in dlls)
             {
                 PublicDelayLoadDLLs.Add(dll);
                 RuntimeDependencies.Add(Path.Combine(BinariesPath, dll), StagedFileType.NonUFS);
             }
-
         }
         else if (Target.Platform == UnrealTargetPlatform.Mac)
         {
+            //TODO: Not compiled mac library
             string LibrariesPath = Path.Combine(Path.Combine(ThirdPartyPath, "ffmpeg", "lib"), "osx");
-
             System.Console.WriteLine("... LibrariesPath -> " + LibrariesPath);
 
             string[] libs = { "libavcodec.58.dylib", "libavdevice.58.dylib", "libavfilter.7.dylib", "libavformat.58.dylib", "libavutil.56.dylib", "libswresample.3.dylib", "libswscale.5.dylib", "libpostproc.55.dylib" };
@@ -60,46 +53,20 @@ public class UFFmpeg : ModuleRules
             }
 
         }
-        // Include path
-        PublicIncludePaths.Add(Path.Combine(ThirdPartyPath, "ffmpeg", "include"));
-        PublicIncludePaths.Add(Path.Combine(Directory.GetCurrentDirectory(), "Runtime","AudioMixer","Private"));
+        else if (Target.Platform == UnrealTargetPlatform.Linux)
+        {
+            //TODO: Not compiled linux library
+            string LibrariesPath = Path.Combine(Path.Combine(ThirdPartyPath, "ffmpeg", "lib"), "amd64");
+            System.Console.WriteLine("... LibrariesPath -> " + LibrariesPath);
 
-
-        PublicDependencyModuleNames.AddRange(
-            new string[]
+            string[] libs = { "libavcodec.a", "libavdevice.a", "libavfilter.a", "libavformat.a", "libavutil.a", "libswresample.a", "libswscale.a", "libpostproc.a" };
+            foreach (string lib in libs)
             {
-                "Core",
-                "AudioMixer",
-				// ... add other public dependencies that you statically link with here ...
-			}
-            );
+                PublicAdditionalLibraries.Add(Path.Combine(LibrariesPath, lib));
+                RuntimeDependencies.Add(Path.Combine(LibrariesPath, lib), StagedFileType.NonUFS);
+            }
 
-        PrivateDependencyModuleNames.AddRange(
-            new string[]
-            {
-                "CoreUObject",
-                "Engine",
-                "Slate",
-                "SlateCore",
-                "Projects",
-                "Engine",
-                "RHI",
-                "UnrealEd",
-                "RenderCore"
-				// ... add private dependencies that you statically link with here ...	
-			}
-            );
-
-
-        OptimizeCode = CodeOptimization.InShippingBuildsOnly;
-        //bEnableUndefinedIdentifierWarnings = false;
-
-        DynamicallyLoadedModuleNames.AddRange(
-            new string[]
-            {
-				// ... add any modules that your module loads dynamically here ...
-			}
-            );
-
+            PublicIncludePaths.Add(Path.Combine(ThirdPartyPath, "ffmpeg", "include", "amd64"));
+        }
     }
 }

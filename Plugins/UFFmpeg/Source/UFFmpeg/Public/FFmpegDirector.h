@@ -27,106 +27,128 @@ extern "C"
 }
 #include "FFmpegDirector.generated.h"
 
-/**
- * 
- */
 class FEncoderThread;
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnConnectedDelegate, bool, Connected);
 
 UCLASS(BlueprintType)
-class UFFMPEG_API UFFmpegDirector:public UObject,public ISubmixBufferListener
+class UFFMPEG_API UFFmpegDirector: public UObject, public ISubmixBufferListener
 {
 	GENERATED_BODY()
-public:
 
+public:
 	UFFmpegDirector();
 	virtual ~UFFmpegDirector();
-	UFUNCTION(BlueprintCallable)
-	void Initialize_Director(UWorld* World, FString OutFileName, bool UseGPU,FString VideoFilter,int VideoFps, int VideoBitRate, float AudioDelay,float SoundVolume);
-	void Begin_Receive_AudioData(UWorld* world);
-	void Begin_Receive_VideoData();
 
-	void Encode_Video_Frame(uint8_t *rgb);
-	void Encode_SetCurrentAudioTime(uint8_t* rgb);
-	void Encode_Audio_Frame(uint8_t *rgb);
-	void Encode_Finish();
+    bool Initialize_Director(UWorld* World, int32 VideoLength, FString OutFileName, bool UseGPU, FString VideoFilter, int VideoFps, int VideoBitRate, int AudioBitRate, int AudioSampleRate, float AudioDelay, float SoundVolume);
+	void RegisterAudioListener(UWorld* World);
+	void RegisterVideoDelegate();
+
+	void SetAudioEncodeCurrentTime(double* Time);
+	void EncodeAudioFrame(uint8_t* AudioFrameData);
+	void EncodeVideoFrame(uint8_t* VideoFrameData);
+	void EncodeFinish();
 	
 	virtual void OnNewSubmixBuffer(const USoundSubmix* OwningSubmix, float* AudioData, int32 NumSamples, int32 NumChannels, const int32 SampleRate, double AudioClock) override;
 	void OnBackBufferReady_RenderThread(SWindow& SlateWindow, const FTexture2DRHIRef& BackBuffer);
+    void OnPostResizeBackBuffer(void* Data);
 	bool AddTickTime(float time);
+	bool CheckThreadJobDone(float time);
 
 	void EndWindowReader(const bool i);
-	void EndWindowReader_StandardGame(void* i);
-	
-	void DestoryDirector();
-	
+	void EndWindowReaderStandardGame(void* i);
+	void FinishDirector();
+
+public:
+    UFUNCTION()
+    void OnConnectedServerCallback(bool Connected);
+
+    FOnConnectedDelegate ConnectedDelegate;
+
 private:
-	void Create_Video_Encoder(bool is_use_NGPU, const char* out_file_name,int bit_rate);
-	void Create_Audio_Encoder(const char* audioencoder_name);
-	void Video_Frame_YUV_From_BGR(uint8_t *rgb);
-	void Create_Audio_Swr();
-	void GetScreenVideoData();
+    bool CreateVideoEncoder(bool UseNGPU, const char* FileName, int BitRate);
+    void CreateAudioEncoder(const char* EncoderName, int BitRate, int SampleRate);
+    void CreateAudioSwresample(int SampleRate);
+	void CreateVideoGraphFilter();
+    void CreateStateTexture();
 
 	void AddTickFunction();
-	void AddEndFunction();
 	void CreateEncodeThread();
-	void Set_Audio_Volume(AVFrame *frame);
+    void ResizeEncodeThread();
+	void AddEndFunction();
 
-	void Alloc_Video_Filter();
+	void GrabSlateFrameData();
+	void ScaleVideoFrame(uint8_t *RGB);
+	void SetAudioChannelData(AVFrame *Frame);
+
+	void StopCapture();
+	void Stop(UWorld* InWorld);
 	uint32 FormatSize_X(uint32 x);
 
 private:
-	bool IsDestory = false;
-	FString filter_descr;
+    UWorld*            World;
+	EWorldType::Type   GameMode;
 
-	int video_fps;
-	uint32 Video_Frame_Duration;
-	float Video_Tick_Time;
-	double CurrentAuidoTime = 0.0;
-	float audio_delay;
-	float audio_volume;
-	uint32 width;
-	uint32 height;
-	uint32 out_width;
-	uint32 out_height;
+	FString            FileAddress;
+    int                IsUseRTMP;
+    bool               IsClosing;
+    bool               IsConnected;
+    bool               IsMarkReceive;
+    bool               IsDestory;
 
-	FTexture2DRHIRef GameTexture;
+	uint32             Width;
+	uint32             Height;
+	uint32             OutWidth;
+	uint32             OutHeight;
+	int                VideoFps;
+	uint64             TotalFrame;
+	uint64             FrameCount;
+	uint64             VideoCounter;
+	uint32             FrameDuration;
+	float              VideoTickTime;
 
+    bool               IsTextured;
+	SWindow*           SlateWindow;
+	TArray<FColor>     TexturePixel;
+	FTexture2DRHIRef   GameTexture;
+	FTexture2DRHIRef   CopyedTexture;
+    AVFormatContext*   FormatContext;
+    AVCodecContext*    VideoCodecContext;
+	AVStream*          VideoStream;
+	int32_t            VideoStreamIndex;
+	AVFrame*           VideoFrame;
+    int64              VideoLastSendPts;
+	uint8_t*           VideoFrameBufferPtr;
+	uint32             LolStride;
 
-	AVFilterInOut *outputs;
-	AVFilterInOut *inputs;
-	AVFilterGraph *filter_graph;
-	AVFilterContext *buffersink_ctx;
-	AVFilterContext *buffersrc_ctx;
+	double             TickedTime;
+	double             CurrentTime;
+	float              AudioDelay;
+	float              AudioVolume;
+	uint64             AudioCounter;
+	FAudioDevice*      AudioDevice;
+    AVCodecContext*    AudioCodecContext;
+	AVStream*          AudioStream;
+	AVFrame*           AudioFrame;
+    int64              AudioLastSendPts;
+	int32_t            AudioStreamIndex;
 
-	FAudioDevice* AudioDevice;
-	SWindow* gameWindow;
-	TArray<FColor> TexturePixel;
-	float ticktime = 0.0f;
-	int64_t video_pts = 0;
-	uint8_t* buff_bgr;
-	int32_t video_index;
-	int32_t audio_index;
+	SwrContext*        SWResample;
+	SwsContext*        SWSResampleContext;
+	uint8_t*           SWSResampleOuts[2];
 
-	FEncoderThread * Runnable;
-	FRunnableThread* RunnableThread;
+    FString            FilterDescription;
+    AVFilterGraph*     FilterGraph;
+    AVFilterInOut*     FilterInputs;
+    AVFilterInOut*     FilterOutputs;
+    AVFilterContext*   BufferSource;
+    AVFilterContext*   BufferSink;
 
-	AVFormatContext* out_format_context;
-	AVCodecContext* video_encoder_codec_context;
-	AVCodecContext* audio_encoder_codec_context;
-
-	SwsContext* sws_context;
-	AVStream* out_video_stream;
-	AVStream* out_audio_stream;
-	SwrContext* swr;
-	uint8_t* outs[2];
-
-	FDelegateHandle TickDelegateHandle;
-	FDelegateHandle EndPIEDelegateHandle;
-
-	AVFrame* audio_frame;
-	AVFrame* video_frame;
-
-	uint32 LolStride;
-	TEnumAsByte<EWorldType::Type> GameMode;
+    FEncoderThread*    Runnable;
+    FRunnableThread*   RunnableThread;
+	FDelegateHandle    EndPIEDelegateHandle;
+	FDelegateHandle    BackBufferReadyHandle;
+    FDelegateHandle    ResizeBackBufferHandle;
+	FTSTicker::FDelegateHandle    TickDelegateHandle;
+	FTSTicker::FDelegateHandle    CheckDelegateHandle;
 };
