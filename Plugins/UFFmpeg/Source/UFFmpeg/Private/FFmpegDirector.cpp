@@ -644,12 +644,12 @@ void UFFmpegDirector::EncodeAudioFrame(uint8_t* InAudioData)
         AudioPkt->pts            = AudioPkt->dts = GetUtcNowMissisecond() - FirstSendPts;
 
 		av_write_frame(FormatContext, AudioPkt);
-		av_packet_unref(AudioPkt);
-
         AudioLastSendPts         = GetUtcNowMissisecond();
 	}
 
     AudioCounter++;
+	av_packet_unref(AudioPkt);
+    av_packet_free(&AudioPkt);
 }
 
 void UFFmpegDirector::EncodeVideoFrame(uint8_t *VideoFrameData)
@@ -736,10 +736,12 @@ void UFFmpegDirector::EncodeVideoFrame(uint8_t *VideoFrameData)
             VideoLastSendPts           = GetUtcNowMissisecond();
 		}
 		av_packet_unref(VideoPkt);
+        av_packet_free(&VideoPkt);
 	}
 
     VideoCounter++;
 	av_frame_unref(FilterFrame);
+    av_frame_free(&FilterFrame);
 }
 
 void UFFmpegDirector::SetAudioEncodeCurrentTime(double* Time)
